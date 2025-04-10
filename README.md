@@ -1,5 +1,5 @@
 ## option-implied-information
-本项目意在探究期权隐含信息与其标的资产价格的关联，包含数据清洗、特征计算、可视化、策略回测五大功能。
+本项目意在探究期权隐含信息与其标的资产价格的关联，包含数据清洗、特征计算、可视化、策略回测四大功能。
 
 ## 示例数据来源：Wind
 示例数据包括来自上海证券交易所的股指ETF合约、大连商品交易所的商品期货期权
@@ -8,10 +8,10 @@
 ### main.py 主程序
 ### OptionPreprocessor.py 数据清洗
 ### feature_calculator.py 特征计算
-实现八大期权隐含特征计算，核心逻辑如下：
+实现以下期权隐含特征计算，核心逻辑如下：
 
 #### VIX (波动率指数)
-- 严格遵循CBOE计算方法，采用近月与次近月合约插值
+- 借鉴CBOE计算方法，采用近月与次近月合约插值
 - 关键步骤：
   1. 通过看跌-看涨平价确定远期价格F
   2. 筛选行权价范围（理论为F的80%-120%）
@@ -60,17 +60,21 @@
 - 转换为每日时间衰减值
 
 #### ITG (隐含尾部收益因子)
-- 针对虚值看涨期权计算
+- 针对虚值看涨期权计算，定价公式见参考文献
 - 通过优化拟合期权价格与行权价之间的关系，得到参数估计xi_hat和beta_hat
 - 最终计算公式：ITG(t) = beta_hat(t) / ((1 - xi_hat(t)) × S(t))
 - 该因子反映了市场对标的资产极端上涨收益的预期
+- 参考文献：The information content of option-implied tail risk on the future
+returns of the underlying asset
 
 #### ITL (隐含尾部损失因子)
-- 针对虚值看跌期权计算
+- 针对虚值看跌期权计算，定价公式见参考文献
 - 通过优化拟合期权价格与行权价之间的关系，得到参数估计xi_hat和beta_hat
 - 最终计算公式：ITL = beta_hat(t) / ((1 - xi_hat(t)) × S(t))
 - 该因子反映了市场对标的资产极端下跌损失的预期
-    
+- 参考文献：The information content of option-implied tail risk on the future
+returns of the underlying asset
+
 ### FeaturePlotter.py 可视化
 可视化各特征与标的资产价格走势
 
@@ -85,3 +89,7 @@
    - 金字塔加仓机制
    - 动态头寸调整
    - 风险管理模块
+
+### Enhanced_Backtest.py 增强回测
+- 加入二次特征衍生
+- 加入机器学习模型生成信号
