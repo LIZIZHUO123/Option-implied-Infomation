@@ -3,7 +3,7 @@ import math
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
 from typing import Dict, List, Optional, Tuple
 from sklearn.linear_model import LinearRegression
 from sklearn.impute import KNNImputer
@@ -33,7 +33,9 @@ class FeatureCalculator:
             'PCRatio': self._calc_pcr,
             'TermSlope': self._calc_term_structure,
             'Vega': self._calc_vega,
-            'Theta': self._calc_theta
+            'Theta': self._calc_theta,
+            'ITG': self._calc_itg,
+            'ITL': self._calc_itl
         }
         
         results = []
@@ -490,3 +492,212 @@ class FeatureCalculator:
             lambda g: g.apply(compute_theta, axis=1).mean()
         )
         return theta.rename('Theta')
+    
+    def compute_theta(self, row) -> float:
+        """计算单个期权的Theta值"""
+        try:
+            S = row[self.col['underlying_price']]
+            K = row[self.col['strike']]
+            T = max(row['T'], 1e-4)
+            sigma = row.get('iv', 0.2)
+            r = self.r
+            
+            d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+            d2 = d1 - sigma*np.sqrt(T)
+            
+            term1 = - (S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+            if row['type'] == 'C':
+                term2 = - r * K * np.exp(-r*T) * norm.cdf(d2)
+            else:
+                term2 = r * K * np.exp(-r*T) * norm.cdf(-d2)
+            
+            return (term1 + term2) / 365  # 转换为每日theta
+        except:
+            return np.nan
+
+    def _calc_itg(self, merged_data: pd.DataFrame) -> pd.Series:
+        """隐含尾部收益因子"""
+        # 获取列名映射
+        date_col = self.col['date']
+        strike_col = self.col['strike']
+        underlying_price_col = self.col['underlying_price']
+        settle_col = self.col['settle']
+        volume_col = self.col['volume']
+        type_col = 'type'  # 假设type列名正确
+        
+        # 计算每个期权的Theta
+        merged_data['Theta'] = merged_data.apply(self.compute_theta, axis=1)
+        
+        # 筛选虚值看涨期权（行权价>标的价格，且Theta < 0.8）
+        '''
+        call_condition = (
+            (merged_data[type_col] == 'C') & 
+            (merged_data[strike_col] > merged_data[underlying_price_col]) & 
+            (merged_data['Theta'] < 0.8)
+        )
+        '''
+        call_condition = (
+            (merged_data[type_col] == 'C') & 
+            (merged_data[strike_col] > merged_data[underlying_price_col])
+        )
+
+        call_options = merged_data[call_condition].copy()
+        
+        if call_options.empty:
+            self.logger.warning("无有效虚值看涨期权数据")
+            return pd.Series(name='ITG', dtype=float)
+        
+        results = []
+        for date, group in call_options.groupby(date_col):
+            try:
+                # 提取必要数据
+                strikes = group[strike_col].values
+                market_prices = group[settle_col].values
+                volumes = group[volume_col].values
+                S = group[underlying_price_col].iloc[0]
+                
+                # 确定参考行权价K（中位数）
+                median_idx = np.argsort(strikes)[len(strikes) // 2]
+                K = strikes[median_idx]
+                C_K = market_prices[median_idx]
+                
+                # 筛选K_i > K的期权
+                valid = strikes > K
+                strikes = strikes[valid]
+                market_prices = market_prices[valid]
+                volumes = volumes[valid]
+                
+                if len(strikes) == 0:
+                    continue
+                
+                # 计算权重（成交量占比）
+                total_volume = volumes.sum()
+                if total_volume <= 0:
+                    continue
+                weights = volumes / total_volume
+                
+                # 定义优化目标函数
+                def objective(params):
+                    xi, beta = params
+                    theoretical = C_K * (xi / beta * (strikes - K) + 1) ** (1 - 1/xi)
+                    errors = market_prices - theoretical
+                    return np.sum(weights * (errors ** 2))
+                
+                # 参数优化
+                initial_guess = [0.01, 1.0]
+                bounds = [(1e-10, None), (1e-10, None)]
+                result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+                
+                if not result.success:
+                    self.logger.warning(f"日期 {date} 参数优化失败: {result.message}")
+                    continue
+                
+                xi_hat, beta_hat = result.x
+                
+                # 计算ITG因子
+                itg = beta_hat / ((1 - xi_hat) * S)
+                results.append((date, itg))
+                
+            except Exception as e:
+                self.logger.error(f"日期 {date} 计算异常: {str(e)}")
+                continue
+        
+        if not results:
+            return pd.Series(name='ITG', dtype=float)
+        
+        # 转换为时间序列
+        dates, itg_values = zip(*results)
+        return pd.Series(itg_values, index=pd.to_datetime(dates), name='ITG').sort_index()
+    
+    def _calc_itl(self, merged_data: pd.DataFrame) -> pd.Series:
+        """隐含尾部损失因子（针对虚值看跌期权）"""
+        # 获取列名映射
+        date_col = self.col['date']
+        strike_col = self.col['strike']
+        underlying_price_col = self.col['underlying_price']
+        settle_col = self.col['settle']
+        volume_col = self.col['volume']
+        type_col = 'type'
+
+        '''
+        # 筛选虚值看跌期权（行权价<标的价格，且Theta > -0.8）
+        put_condition = (
+            (merged_data[type_col] == 'P') & 
+            (merged_data[strike_col] < merged_data[underlying_price_col]) & 
+            (merged_data['Theta'] > -0.8)  # 使用计算好的Theta列
+        )
+
+        '''
+        put_condition = (
+            (merged_data[type_col] == 'P') & 
+            (merged_data[strike_col] < merged_data[underlying_price_col])
+        )
+        
+
+        put_options = merged_data[put_condition].copy()
+
+        if put_options.empty:
+            self.logger.warning("无有效虚值看跌期权数据")
+            return pd.Series(name='ITL', dtype=float)
+
+        results = []
+        for date, group in put_options.groupby(date_col):
+            try:
+                # 提取必要数据
+                strikes = group[strike_col].values
+                market_prices = group[settle_col].values
+                volumes = group[volume_col].values
+                S = group[underlying_price_col].iloc[0]
+
+                # 确定参考行权价K（中位数）
+                median_idx = np.argsort(strikes)[len(strikes) // 2]
+                K = strikes[median_idx]
+                P_K = market_prices[median_idx]
+
+                # 筛选K_i < K的期权
+                valid = strikes < K
+                strikes = strikes[valid]
+                market_prices = market_prices[valid]
+                volumes = volumes[valid]
+
+                if len(strikes) == 0:
+                    continue
+
+                # 计算权重（成交量占比）
+                total_volume = volumes.sum()
+                if total_volume <= 0:
+                    continue
+                weights = volumes / total_volume
+
+                # 定义优化目标函数（调整理论价格公式）
+                def objective(params):
+                    xi, beta = params
+                    theoretical = P_K * (xi / beta * (K - strikes) + 1) ** (1 - 1/xi)
+                    errors = market_prices - theoretical
+                    return np.sum(weights * (errors ** 2))
+
+                # 参数优化
+                initial_guess = [0.01, 1.0]
+                bounds = [(1e-10, None), (1e-10, None)]
+                result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+
+                if not result.success:
+                    self.logger.warning(f"日期 {date} 参数优化失败: {result.message}")
+                    continue
+
+                xi_hat, beta_hat = result.x
+
+                # 计算ITL因子（公式形式与ITG相同）
+                itl = beta_hat / ((1 - xi_hat) * S)
+                results.append((date, itl))
+
+            except Exception as e:
+                self.logger.error(f"日期 {date} 计算异常: {str(e)}")
+                continue
+
+        if not results:
+            return pd.Series(name='ITL', dtype=float)
+
+        # 转换为时间序列
+        dates, itl_values = zip(*results)
+        return pd.Series(itl_values, index=pd.to_datetime(dates), name='ITL').sort_index()
